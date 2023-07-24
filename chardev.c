@@ -23,6 +23,7 @@
 #include "enumerate.h"
 #include "ioctl.h"
 #include "pcie.h"
+#include "sg_helpers.h"
 
 // In Linux 5.0, dma_alloc_coherent always zeroes memory and dma_zalloc_coherent
 // was removed.
@@ -562,7 +563,8 @@ static long ioctl_pin_pages(struct chardev_private *priv,
 	if (!PAGE_ALIGNED(in.virtual_address) || !PAGE_ALIGNED(in.size) || in.size == 0)
 		return -EINVAL;
 
-	if (!(in.flags & TENSTORRENT_PIN_PAGES_CONTIGUOUS))
+	if (in.flags != TENSTORRENT_PIN_PAGES_CONTIGUOUS
+	    && in.flags != TENSTORRENT_PIN_PAGES_INTO_IOMMU)
 		return -EINVAL;
 
 	pinning = kmalloc(sizeof(*pinning), GFP_KERNEL);
@@ -590,10 +592,58 @@ static long ioctl_pin_pages(struct chardev_private *priv,
 		goto err_unpin_pages;
 	}
 
-	for (i = 1; i < pages_pinned; i++) {
-		if (page_to_pfn(pages[i]) != page_to_pfn(pages[i-1]) + 1) {
-			pr_err("pages discontiguous at %d\n", i);
+	if (in.flags & TENSTORRENT_PIN_PAGES_CONTIGUOUS) {
+		for (i = 1; i < pages_pinned; i++) {
+			if (page_to_pfn(pages[i]) != page_to_pfn(pages[i-1]) + 1) {
+				pr_err("pages discontiguous at %d\n", i);
+				ret = -EINVAL;
+				goto err_unpin_pages;
+			}
+		}
+	} else if (in.flags & TENSTORRENT_PIN_PAGES_INTO_IOMMU) {
+		struct sg_table table = {0};
+		struct scatterlist *sg;
+		unsigned int i;
+
+		if (!alloc_chained_sgt_for_pages(&table, pages, nr_pages)) {
+			pr_warn("alloc_chained_sgt_for_pages failed for %lu pages, probably out of memory.\n", nr_pages);
+			ret = -ENOMEM;
+			goto err_unpin_pages;
+		}
+
+		pr_debug("alloc_chained_sgt_for_pages found %u contigs.\n", table.nents);
+		for_each_sgtable_sg(&table, sg, i) {
+			pr_debug("\t%lX + %X\n", sg->page_link, sg->length);
+		}
+
+		if (dma_map_sgtable(&priv->device->pdev->dev, &table, DMA_BIDIRECTIONAL, 0) == 0) {
+			dma_addr_t expected_next_address;
+			unsigned long total_dma_len = 0;
+
+			pr_debug("dma_map_sgtable returned %u\n", table.nents);
+
+			for_each_sgtable_dma_sg(&table, sg, i) {
+				pr_debug("%llX + %X\n", sg_dma_address(sg), sg_dma_len(sg));
+				if (i > 0 && sg_dma_address(sg) != expected_next_address) {
+					pr_err("discontiguous mapping\n");
+				}
+				expected_next_address = sg_dma_address(sg) + sg_dma_len(sg);
+				total_dma_len += sg_dma_len(sg);
+			}
+
+			if (total_dma_len != nr_pages * PAGE_SIZE)
+				pr_err("dma-mapped (%lX) != original length (%lX).\n", total_dma_len, nr_pages * PAGE_SIZE);
+
+			dma_unmap_sgtable(&priv->device->pdev->dev, &table, DMA_BIDIRECTIONAL, 0);
+
+			free_chained_sgt(&table);
 			ret = -EINVAL;
+			goto err_unpin_pages;
+
+		} else {
+			pr_err("dma_map_sg failed.\n");
+			free_chained_sgt(&table);
+			ret = -ENOMEM;
 			goto err_unpin_pages;
 		}
 	}
