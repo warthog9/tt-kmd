@@ -159,6 +159,8 @@ struct pinned_page_range {
 
 	unsigned long page_count;
 	struct page **pages;	// vmalloc/vfree
+
+	struct sg_table dma_mapping;	// alloc_chained_sgt_for_pages / free_chained_sgt
 };
 
 // This is our device-private data assocated with each open character device fd.
@@ -548,9 +550,13 @@ static long ioctl_pin_pages(struct chardev_private *priv,
 	struct page **pages;
 	int pages_pinned;
 	struct pinned_page_range *pinning;
+	struct sg_table dma_mapping = {0};
 	long ret;
-	int i;
 	u32 bytes_to_copy;
+	struct scatterlist *sg;
+	unsigned int i;
+	dma_addr_t expected_next_address;
+	unsigned long total_dma_len = 0;
 
 	struct tenstorrent_pin_pages_in in;
 	struct tenstorrent_pin_pages_out out;
@@ -592,68 +598,53 @@ static long ioctl_pin_pages(struct chardev_private *priv,
 		goto err_unpin_pages;
 	}
 
-	if (in.flags & TENSTORRENT_PIN_PAGES_CONTIGUOUS) {
-		for (i = 1; i < pages_pinned; i++) {
-			if (page_to_pfn(pages[i]) != page_to_pfn(pages[i-1]) + 1) {
-				pr_err("pages discontiguous at %d\n", i);
-				ret = -EINVAL;
-				goto err_unpin_pages;
-			}
-		}
-	} else if (in.flags & TENSTORRENT_PIN_PAGES_INTO_IOMMU) {
-		struct sg_table table = {0};
-		struct scatterlist *sg;
-		unsigned int i;
+	if (!alloc_chained_sgt_for_pages(&dma_mapping, pages, nr_pages)) {
+		pr_warn("alloc_chained_sgt_for_pages failed for %lu pages, probably out of memory.\n", nr_pages);
+		ret = -ENOMEM;
+		goto err_unpin_pages;
+	}
 
-		if (!alloc_chained_sgt_for_pages(&table, pages, nr_pages)) {
-			pr_warn("alloc_chained_sgt_for_pages failed for %lu pages, probably out of memory.\n", nr_pages);
-			ret = -ENOMEM;
-			goto err_unpin_pages;
-		}
+	pr_debug("alloc_chained_sgt_for_pages found %u contigs.\n", dma_mapping.nents);
+	for_each_sgtable_sg(&dma_mapping, sg, i) {
+		pr_debug("\t%lX + %X\n", sg->page_link, sg->length);
+	}
 
-		pr_debug("alloc_chained_sgt_for_pages found %u contigs.\n", table.nents);
-		for_each_sgtable_sg(&table, sg, i) {
-			pr_debug("\t%lX + %X\n", sg->page_link, sg->length);
-		}
+	mutex_lock(&priv->mutex);
 
-		if (dma_map_sgtable(&priv->device->pdev->dev, &table, DMA_BIDIRECTIONAL, 0) == 0) {
-			dma_addr_t expected_next_address;
-			unsigned long total_dma_len = 0;
+	ret = dma_map_sgtable(&priv->device->pdev->dev, &dma_mapping, DMA_BIDIRECTIONAL, 0);
 
-			pr_debug("dma_map_sgtable returned %u\n", table.nents);
+	if (ret != 0) {
+		pr_err("dma_map_sg failed.\n");
+		goto err_unlock_priv;
+	}
 
-			for_each_sgtable_dma_sg(&table, sg, i) {
-				pr_debug("%llX + %X\n", sg_dma_address(sg), sg_dma_len(sg));
-				if (i > 0 && sg_dma_address(sg) != expected_next_address) {
-					pr_err("discontiguous mapping\n");
-				}
-				expected_next_address = sg_dma_address(sg) + sg_dma_len(sg);
-				total_dma_len += sg_dma_len(sg);
-			}
+	pr_debug("dma_map_sgtable returned %u entries\n", dma_mapping.nents);
 
-			if (total_dma_len != nr_pages * PAGE_SIZE)
-				pr_err("dma-mapped (%lX) != original length (%lX).\n", total_dma_len, nr_pages * PAGE_SIZE);
+	for_each_sgtable_dma_sg(&dma_mapping, sg, i) {
+		pr_debug("%llX + %X\n", sg_dma_address(sg), sg_dma_len(sg));
 
-			dma_unmap_sgtable(&priv->device->pdev->dev, &table, DMA_BIDIRECTIONAL, 0);
-
-			free_chained_sgt(&table);
+		if (i > 0 && sg_dma_address(sg) != expected_next_address) {
+			pr_err("discontiguous mapping\n");
 			ret = -EINVAL;
-			goto err_unpin_pages;
-
-		} else {
-			pr_err("dma_map_sg failed.\n");
-			free_chained_sgt(&table);
-			ret = -ENOMEM;
-			goto err_unpin_pages;
+			goto err_dma_unmap;
 		}
+
+		expected_next_address = sg_dma_address(sg) + sg_dma_len(sg);
+		total_dma_len += sg_dma_len(sg);
+	}
+
+	if (total_dma_len != nr_pages * PAGE_SIZE) {
+		pr_err("dma-mapped (%lX) != original length (%lX).\n", total_dma_len, nr_pages * PAGE_SIZE);
+		ret = -EINVAL;
+		goto err_dma_unmap;
 	}
 
 	pinning->page_count = nr_pages;
 	pinning->pages = pages;
+	pinning->dma_mapping = dma_mapping;
 
-	out.physical_address = page_to_phys(pages[0]);
+	out.physical_address = sg_dma_address(dma_mapping.sgl);
 
-	mutex_lock(&priv->mutex);
 	list_add(&pinning->list, &priv->pinnings);
 	mutex_unlock(&priv->mutex);
 
@@ -667,6 +658,11 @@ static long ioctl_pin_pages(struct chardev_private *priv,
 
 	return 0;
 
+err_dma_unmap:
+	dma_unmap_sgtable(&priv->device->pdev->dev, &dma_mapping, DMA_BIDIRECTIONAL, 0);
+err_unlock_priv:
+	free_chained_sgt(&dma_mapping);
+	mutex_unlock(&priv->mutex);
 err_unpin_pages:
 	unpin_user_pages_dirty_lock(pages, pages_pinned, false);
 err_vfree_pages:
@@ -1048,6 +1044,9 @@ static int tt_cdev_release(struct inode *inode, struct file *file)
 	}
 
 	list_for_each_entry_safe(pinning, tmp_pinning, &priv->pinnings, list) {
+		dma_unmap_sgtable(&priv->device->pdev->dev, &pinning->dma_mapping, DMA_BIDIRECTIONAL, 0);
+		free_chained_sgt(&pinning->dma_mapping);
+
 		unpin_user_pages_dirty_lock(pinning->pages, pinning->page_count, true);
 		vfree(pinning->pages);
 
