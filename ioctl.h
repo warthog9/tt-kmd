@@ -141,7 +141,8 @@ struct tenstorrent_reset_device {
 };
 
 // tenstorrent_pin_pages_in.flags
-#define TENSTORRENT_PIN_PAGES_CONTIGUOUS 1
+#define TENSTORRENT_PIN_PAGES_CONTIGUOUS 1	// ttkmd verifies that the pages are physically contiguous
+#define TENSTORRENT_PIN_PAGES_INTO_IOMMU 2	// ttkmd uses iommu to map pages, need not be physically contiguous
 
 struct tenstorrent_pin_pages_in {
 	__u32 output_size_bytes;
