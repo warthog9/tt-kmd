@@ -1,12 +1,16 @@
 #include "sg_helpers.h"
 
 #include <linux/kernel.h>
+#include <linux/bug.h>
 
 // -1 because the chain entry requires its own struct scatterlist, and
 // for simplicity we reserve the last entry of every page for the chain.
 // (But note that the end mark is on the last valid scatterlist entry.)
 // On x86-64 this works out to 145.
 #define SCL_PER_PAGE (PAGE_SIZE / sizeof(struct scatterlist) - 1)
+
+// scatterlist length is unsigned int, so we may have to split based on size alone.
+#define MAX_PAGES_PER_SCL (UINT_MAX / PAGE_SIZE)
 
 // This is very similar to sg_alloc_table_from_pages, but we need to go big so
 // we use single-page allocations and scatterlist chaining for unlimited scaling.
@@ -45,19 +49,20 @@ bool alloc_chained_sgt_for_pages(struct sg_table *table, struct page **pages, un
 		while (pages < pages_end && current_scl - page_first_scl < SCL_PER_PAGE) {
 			struct page **contig_start = pages++;
 
-			for (; pages < pages_end; pages++)
+			for (; pages < pages_end && pages - contig_start < MAX_PAGES_PER_SCL; pages++)
 				if (page_to_pfn(pages[-1]) + 1 != page_to_pfn(pages[0]))
 					break;
 
 			sg_set_page(current_scl++, *contig_start, (pages - contig_start) * PAGE_SIZE, 0);
 		}
 
-		table->orig_nents = table->nents += current_scl - page_first_scl;
+		table->nents += current_scl - page_first_scl;
 
 		// Note that current_scl points to the extra entry reserved for chaining.
-		// Chaining entries are not included in nents. sg_next() just skips over them.
+		// Chaining entries are not included in table->nents. sg_next() just skips over them.
 	}
 
+	table->orig_nents = table->nents;
 	sg_mark_end(current_scl);
 	return true;
 
@@ -67,8 +72,9 @@ out_free:
 }
 
 // Free a chained scatterlist created by make_chained_scl_for_pages.
-// Doesn't check each scatterlist entry if it's chain/end, rather asssumes
-// that there are always SCL_PER_PAGE except for the last page.
+// Doesn't check each scatterlist entry if it's chain/end, rather asssumes that there are always
+// SCL_PER_PAGE except for the last page.
+// Also, alloc_chained_sgt_for_pages calls this on failure, in which case there's no SG_END marker.
 void free_chained_sgt(struct sg_table *table)
 {
 	struct scatterlist *next_page = table->sgl;
@@ -81,7 +87,7 @@ void free_chained_sgt(struct sg_table *table)
 			// Not SCL_PER_PAGE-1 because we deducted one in the definition of SCL_PER_PAGE.
 			// (The last entry of each page is reserved for chaining.)
 
-			// assert(sg_is_chain(current_page[SCL_PER_PAGE]));
+			BUG_ON(!sg_is_chain(&current_page[SCL_PER_PAGE]));
 			next_page = sg_chain_ptr(&current_page[SCL_PER_PAGE]);
 			num_entries -= SCL_PER_PAGE;
 		} else {
