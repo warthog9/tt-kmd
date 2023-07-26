@@ -613,7 +613,7 @@ static long ioctl_pin_pages(struct chardev_private *priv,
 	}
 
 	pr_debug("alloc_chained_sgt_for_pages found %u contigs.\n", dma_mapping.nents);
-	for_each_sgtable_sg(&dma_mapping, sg, i) {
+	for_each_sgtable_sg((&dma_mapping), sg, i) {
 		pr_debug("\t%lX + %X\n", sg->page_link, sg->length);
 	}
 
@@ -628,7 +628,7 @@ static long ioctl_pin_pages(struct chardev_private *priv,
 
 	pr_debug("dma_map_sgtable returned %u entries\n", dma_mapping.nents);
 
-	for_each_sgtable_dma_sg(&dma_mapping, sg, i) {
+	for_each_sgtable_dma_sg((&dma_mapping), sg, i) {
 		pr_debug("%llX + %X\n", sg_dma_address(sg), sg_dma_len(sg));
 
 		if (i > 0 && sg_dma_address(sg) != expected_next_address) {
