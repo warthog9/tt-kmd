@@ -629,12 +629,9 @@ static long ioctl_pin_pages(struct chardev_private *priv,
 	pr_debug("dma_map_sgtable returned %u entries\n", dma_mapping.nents);
 
 	for_each_sgtable_dma_sg((&dma_mapping), sg, i) {
-		pr_debug("%llX + %X\n", sg_dma_address(sg), sg_dma_len(sg));
-
 		if (i > 0 && sg_dma_address(sg) != expected_next_address) {
 			pr_err("discontiguous mapping\n");
 			ret = -EINVAL;
-			goto err_dma_unmap;
 		}
 
 		expected_next_address = sg_dma_address(sg) + sg_dma_len(sg);
@@ -644,6 +641,10 @@ static long ioctl_pin_pages(struct chardev_private *priv,
 	if (total_dma_len != nr_pages * PAGE_SIZE) {
 		pr_err("dma-mapped (%lX) != original length (%lX).\n", total_dma_len, nr_pages * PAGE_SIZE);
 		ret = -EINVAL;
+	}
+
+	if (ret != 0) {
+		debug_print_sgtable(&dma_mapping);
 		goto err_dma_unmap;
 	}
 

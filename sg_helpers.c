@@ -97,3 +97,22 @@ void free_chained_sgt(struct sg_table *table)
 		__free_page(virt_to_page(current_page));
 	}
 }
+
+void debug_print_sgtable(struct sg_table *table)
+{
+	struct scatterlist *sg;
+	unsigned int i;
+	dma_addr_t expected_next_address;
+
+	pr_debug("dma_map_sgtable returned %u entries from %u original\n", table->nents, table->orig_nents);
+
+	for_each_sgtable_dma_sg(table, sg, i) {
+		if (i > 0 && sg_dma_address(sg) != expected_next_address) {
+			pr_debug("discontiguous\n");
+		}
+
+		pr_debug("[%4u] %llX + %X\n", i, sg_dma_address(sg), sg_dma_len(sg));
+
+		expected_next_address = sg_dma_address(sg) + sg_dma_len(sg);
+	}
+}
