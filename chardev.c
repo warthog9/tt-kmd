@@ -18,6 +18,7 @@
 #include <linux/hashtable.h>
 #include <linux/vmalloc.h>
 #include <linux/file.h>
+#include <linux/iommu.h>
 
 #include "device.h"
 #include "enumerate.h"
@@ -551,6 +552,12 @@ static long ioctl_reset_device(struct chardev_private *priv,
 	return 0;
 }
 
+static bool is_iommu_translated(struct device *dev)
+{
+	struct iommu_domain *domain = iommu_get_domain_for_dev(dev);
+	return domain && domain->type != IOMMU_DOMAIN_IDENTITY;
+}
+
 static long ioctl_pin_pages(struct chardev_private *priv,
 			    struct tenstorrent_pin_pages __user *arg)
 {
@@ -561,10 +568,6 @@ static long ioctl_pin_pages(struct chardev_private *priv,
 	struct sg_table dma_mapping = {0};
 	long ret;
 	u32 bytes_to_copy;
-	struct scatterlist *sg;
-	unsigned int i;
-	dma_addr_t expected_next_address;
-	unsigned long total_dma_len = 0;
 
 	struct tenstorrent_pin_pages_in in;
 	struct tenstorrent_pin_pages_out out;
@@ -606,53 +609,74 @@ static long ioctl_pin_pages(struct chardev_private *priv,
 		goto err_unpin_pages;
 	}
 
-	if (!alloc_chained_sgt_for_pages(&dma_mapping, pages, nr_pages)) {
-		pr_warn("alloc_chained_sgt_for_pages failed for %lu pages, probably out of memory.\n", nr_pages);
-		ret = -ENOMEM;
-		goto err_unpin_pages;
-	}
+	if (is_iommu_translated(&priv->device->pdev->dev)) {
+		struct scatterlist *sg;
+		unsigned int i;
+		dma_addr_t expected_next_address;
+		unsigned long total_dma_len = 0;
 
-	pr_debug("alloc_chained_sgt_for_pages found %u contigs.\n", dma_mapping.nents);
-	for_each_sgtable_sg((&dma_mapping), sg, i) {
-		pr_debug("\t%lX + %lX\n", page_to_pfn(sg_page(sg)), sg->length / PAGE_SIZE);
-	}
+		if (!alloc_chained_sgt_for_pages(&dma_mapping, pages, nr_pages)) {
+			pr_warn("alloc_chained_sgt_for_pages failed for %lu pages, probably out of memory.\n", nr_pages);
+			ret = -ENOMEM;
+			goto err_unpin_pages;
+		}
 
-	mutex_lock(&priv->mutex);
+		pr_debug("alloc_chained_sgt_for_pages found %u contigs.\n", dma_mapping.nents);
+		for_each_sgtable_sg((&dma_mapping), sg, i) {
+			pr_debug("\t%lX + %lX\n", page_to_pfn(sg_page(sg)), sg->length / PAGE_SIZE);
+		}
 
-	ret = dma_map_sgtable(&priv->device->pdev->dev, &dma_mapping, DMA_BIDIRECTIONAL, 0);
+		mutex_lock(&priv->mutex);
 
-	if (ret != 0) {
-		pr_err("dma_map_sg failed.\n");
-		goto err_unlock_priv;
-	}
+		ret = dma_map_sgtable(&priv->device->pdev->dev, &dma_mapping, DMA_BIDIRECTIONAL, 0);
 
-	pr_debug("dma_map_sgtable returned %u entries\n", dma_mapping.nents);
+		if (ret != 0) {
+			pr_err("dma_map_sg failed.\n");
+			goto err_unlock_priv;
+		}
 
-	for_each_sgtable_dma_sg((&dma_mapping), sg, i) {
-		if (i > 0 && sg_dma_address(sg) != expected_next_address) {
-			pr_err("discontiguous mapping\n");
+		pr_debug("dma_map_sgtable returned %u entries\n", dma_mapping.nents);
+
+		for_each_sgtable_dma_sg((&dma_mapping), sg, i) {
+			if (i > 0 && sg_dma_address(sg) != expected_next_address) {
+				pr_err("discontiguous mapping\n");
+				ret = -EINVAL;
+			}
+
+			expected_next_address = sg_dma_address(sg) + sg_dma_len(sg);
+			total_dma_len += sg_dma_len(sg);
+		}
+
+		if (total_dma_len != nr_pages * PAGE_SIZE) {
+			pr_err("dma-mapped (%lX) != original length (%lX).\n", total_dma_len, nr_pages * PAGE_SIZE);
 			ret = -EINVAL;
 		}
 
-		expected_next_address = sg_dma_address(sg) + sg_dma_len(sg);
-		total_dma_len += sg_dma_len(sg);
-	}
+		if (ret != 0) {
+			debug_print_sgtable(&dma_mapping);
+			goto err_dma_unmap;
+		}
 
-	if (total_dma_len != nr_pages * PAGE_SIZE) {
-		pr_err("dma-mapped (%lX) != original length (%lX).\n", total_dma_len, nr_pages * PAGE_SIZE);
-		ret = -EINVAL;
-	}
+		out.physical_address = sg_dma_address(dma_mapping.sgl);
+	} else {
+		int i;
 
-	if (ret != 0) {
-		debug_print_sgtable(&dma_mapping);
-		goto err_dma_unmap;
+		for (i = 1; i < pages_pinned; i++) {
+			if (page_to_pfn(pages[i]) != page_to_pfn(pages[i-1]) + 1) {
+				pr_err("pages discontiguous at %d\n", i);
+				ret = -EINVAL;
+				goto err_unpin_pages;
+			}
+		}
+
+		out.physical_address = page_to_phys(pages[0]);
+
+		mutex_lock(&priv->mutex);
 	}
 
 	pinning->page_count = nr_pages;
 	pinning->pages = pages;
 	pinning->dma_mapping = dma_mapping;
-
-	out.physical_address = sg_dma_address(dma_mapping.sgl);
 
 	list_add(&pinning->list, &priv->pinnings);
 	mutex_unlock(&priv->mutex);
