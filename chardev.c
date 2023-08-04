@@ -636,11 +636,6 @@ static long ioctl_pin_pages(struct chardev_private *priv,
 			goto err_unpin_pages;
 		}
 
-		pr_debug("alloc_chained_sgt_for_pages found %u contigs.\n", dma_mapping.nents);
-		for_each_sgtable_sg((&dma_mapping), sg, i) {
-			pr_debug("\t%lX + %lX\n", page_to_pfn(sg_page(sg)), sg->length / PAGE_SIZE);
-		}
-
 		mutex_lock(&priv->mutex);
 
 		ret = dma_map_sgtable(&priv->device->pdev->dev, &dma_mapping, DMA_BIDIRECTIONAL, 0);
@@ -650,8 +645,7 @@ static long ioctl_pin_pages(struct chardev_private *priv,
 			goto err_unlock_priv;
 		}
 
-		pr_debug("dma_map_sgtable returned %u entries\n", dma_mapping.nents);
-
+		// This can only happen due to a misconfiguration or a bug.
 		for_each_sgtable_dma_sg((&dma_mapping), sg, i) {
 			if (i > 0 && sg_dma_address(sg) != expected_next_address) {
 				pr_err("discontiguous mapping\n");
