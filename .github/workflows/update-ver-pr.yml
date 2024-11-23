@@ -1,0 +1,44 @@
+name: Send Pull Requests for new version
+run-name: Send Pull Requests for new version
+on:
+  workflow_dispatch:
+  workflow_call:
+  #push:
+  #  tags: [ 'ttkmd-*' ]
+
+jobs:
+  updatedocs:
+    permissions: write-all
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          #repository: 'tenstorrent/tenstorrent.github.io'
+          repository: 'warthog9/tenstorrent.github.io'
+          fetch-tags: true
+          fetch-depth: 0
+      - run: |
+          echo ${{ github.ref_name }} | \
+          sed 's/^ttkmd-//' \
+          > syseng/kmd.version
+      - run: cat syseng/kmd.version
+      - run: ls -lah syseng/
+      - name: Commit the change
+        run: |
+          git checkout -b kmd-$( echo ${{ github.ref_name }} | sed 's/^ttkmd-//')
+          git config user.name "tt-version[bot]"
+          git config user.email "github-version-bot@noreply.tenstorrent.com"
+          git add syseng/kmd.version
+          git commit -m "Syseng: Updating tt-kmd version to $( echo ${{ github.ref_name }} | sed 's/^ttkmd-//')"
+      - run: git branch
+      - run: git push --set-upstream origin kmd-main
+      - name: Open PR
+        run: |
+          gh \
+            pr \
+            create \
+            -B main \
+            --title "Syseng: Updating tt-kmd version to $( echo ${{ github.ref_name }} | sed 's/^ttkmd-//')" \
+            --body 'Created by Github action'
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
