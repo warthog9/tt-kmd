@@ -1,3 +1,14 @@
+tt-kmd (2.4.0) noble; urgency=medium
+
+  [ John 'Warthog9' Hawley ]
+  * Adding in the workflows we are using elsewhere
+
+  [ Tenstorrent Releases ]
+  * Setting up to do a minor version bump
+  * Updating version to 2.4.0
+
+ -- Tenstorrent Releases <releases@tenstorrent.com>  Fri, 08 Aug 2025 00:26:02 +0000
+
 tt-kmd (2.3.0) unstable; urgency=medium
 
   * Add new 'tt_asic_id' sysfs attribute for Wormhole.
